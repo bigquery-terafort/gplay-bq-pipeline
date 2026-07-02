@@ -1,0 +1,92 @@
+name: Play Console -> BigQuery (daily)
+
+# ============================ PUBLIC-REPO SAFETY ============================
+# This workflow is designed to be safe in a PUBLIC repository:
+#   * All config comes from GitHub SECRETS -> auto-masked (***) in public logs.
+#   * Triggers are `schedule` and `workflow_dispatch` ONLY. Fork pull requests
+#     CANNOT trigger this workflow and CANNOT mint cloud credentials.
+#   * NEVER add `pull_request` or `pull_request_target` triggers to this file.
+#   * Zero third-party actions run in this job — only GitHub- and Google-owned
+#     actions touch the runner that holds the short-lived cloud credentials.
+#   * Recommended repo setting: Settings -> Actions -> General ->
+#     "Require approval for all external contributors".
+# ============================================================================
+
+on:
+  schedule:
+    # 06:30 UTC daily. Play data lags 3-7 days, so timing doesn't matter; a late
+    # or skipped run is harmless because the per-month reload self-heals.
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "How many recent months to (re)load. Use a big number (e.g. 120) once to backfill history."
+        required: false
+        default: "2"
+
+permissions:
+  id-token: write      # REQUIRED: lets the job mint a GitHub OIDC token for WIF
+  contents: write      # needed only by the keepalive step (empty commit ~every 45d)
+
+concurrency:
+  group: play-reports
+  cancel-in-progress: false
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    # Daily runs finish in ~5-15 min. The one-time 120-month backfill can take
+    # 1-3 hours (tens of thousands of small files) — this ceiling covers it.
+    # Public repos get UNLIMITED free Actions minutes, so time costs nothing.
+    timeout-minutes: 300
+    steps:
+      - name: Checkout (must run before auth)
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (keyless, via Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+          # create_credentials_file defaults to true and sets
+          # GOOGLE_APPLICATION_CREDENTIALS, which the Python client libs auto-use.
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        # Only two official Google client libraries, version-bounded. No
+        # requirements.txt needed — this IS the dependency manifest.
+        run: pip install "google-cloud-storage>=2.18,<4" "google-cloud-bigquery>=3.25,<4"
+
+      - name: Load Play reports into BigQuery
+        env:
+          GCS_PLAY_BUCKET: ${{ secrets.GCS_PLAY_BUCKET }}
+          GCP_PROJECT_ID:  ${{ secrets.GCP_PROJECT_ID }}
+          BQ_DATASET:      ${{ secrets.BQ_DATASET }}
+          BQ_LOCATION:     ${{ secrets.BQ_LOCATION }}
+          MONTHS_TO_LOAD:  ${{ github.event.inputs.months || '2' }}
+          # Optional (add as Secrets only if you want them):
+          APPS_ALLOWLIST:            ${{ secrets.APPS_ALLOWLIST }}
+          PARTITION_EXPIRATION_DAYS: ${{ secrets.PARTITION_EXPIRATION_DAYS }}
+        run: python main.py
+
+      - name: Keepalive (defeat GitHub's 60-day scheduled-workflow auto-disable)
+        # Deliberately NOT a third-party action: in a public repo, any external
+        # action in this job could read the short-lived cloud credentials file.
+        # Plain git keeps the supply chain at zero and can never be deprecated.
+        # An empty commit every ~45 days resets GitHub's inactivity timer.
+        run: |
+          set -euo pipefail
+          last_commit=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          days_since=$(( (now - last_commit) / 86400 ))
+          echo "Days since last commit: ${days_since}"
+          if [ "${days_since}" -ge 45 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive (automated)"
+            git push
+          fi

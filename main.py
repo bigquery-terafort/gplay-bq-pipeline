@@ -97,6 +97,11 @@ _RETRY = Retry(initial=1.0, maximum=30.0, multiplier=2.0, timeout=300.0)
 # cleans to one of these is dropped (our version is authoritative).
 RESERVED_COLUMNS = {"report_month_date", "package_name", "_loaded_at", "_source_file"}
 
+# Account-wide financial reports (sales/earnings) identify the app in Google's
+# own column. We promote it into `package_name` per row, so EVERY table shares
+# one canonical join key. Ordered by preference; extend if Google renames again.
+_APP_ID_COLUMNS = ("package_id", "product_id")
+
 
 class FileRef(NamedTuple):
     """A matched report file: which blob, which app, which month."""
@@ -186,7 +191,15 @@ def _annotate(rows: list[dict], pkg: str, ym: str, source: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
     for r in rows:
         r["report_month_date"] = month_date
-        r["package_name"] = pkg
+        if pkg == "__account__":
+            # Financial rows: promote Google's own app column (package_id /
+            # product_id) into the canonical join key. Rows Google doesn't
+            # attribute to an app (e.g. balance adjustments) stay __account__.
+            r["package_name"] = next(
+                (r[c] for c in _APP_ID_COLUMNS if r.get(c)), "__account__"
+            )
+        else:
+            r["package_name"] = pkg
         r["_loaded_at"] = now
         r["_source_file"] = source
 

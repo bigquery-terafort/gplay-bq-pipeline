@@ -131,8 +131,18 @@ def _dedupe(cols: list[str]) -> list[str]:
 
 
 def _decode(raw: bytes) -> str:
-    """Play CSVs are UTF-16LE with a BOM. Fall back defensively; never crash."""
-    for enc in ("utf-16", "utf-8-sig", "utf-8", "latin-1"):
+    """Play stats CSVs are UTF-16LE with a BOM; financial CSVs (sales/earnings)
+    are UTF-8 with no BOM. Sniff the BOM first, then use NUL-byte density to
+    tell BOM-less UTF-16 apart from UTF-8 — never guess UTF-16 on UTF-8 bytes
+    (that silently turns revenue data into mojibake). Never crash."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    if raw[:3] == b"\xef\xbb\xbf":
+        return raw.decode("utf-8-sig", errors="replace")
+    sample = raw[:4096]
+    if sample.count(b"\x00") > len(sample) // 4:
+        return raw.decode("utf-16", errors="replace")
+    for enc in ("utf-8", "latin-1"):
         try:
             return raw.decode(enc)
         except (UnicodeDecodeError, UnicodeError):

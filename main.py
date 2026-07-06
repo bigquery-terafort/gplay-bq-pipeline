@@ -27,7 +27,9 @@ Run locally  : `gcloud auth application-default login` then `python main.py`
 Run in CI    : auth handled by Workload Identity Federation (see workflow YAML)
 
 Environment:
-  GCS_PLAY_BUCKET            required  gs://pubsite_prod_rev_... URI or bucket id
+  GCS_PLAY_BUCKET            required  ONE bucket URI/id — or a COMMA-SEPARATED
+                                       list of them to sweep multiple Play
+                                       developer accounts in a single run
   GCP_PROJECT_ID             required  your GCP project id
   BQ_DATASET                 optional  default: play_reports
   BQ_LOCATION                optional  default: US (decide before first run)
@@ -204,6 +206,40 @@ def _annotate(rows: list[dict], pkg: str, ym: str, source: str) -> None:
         r["_source_file"] = source
 
 
+def _parse_buckets(raw: str) -> list[str]:
+    """'gs://a/x, gs://b' -> ['gs://a/x', 'gs://b']. One or many buckets."""
+    return [b.strip() for b in raw.split(",") if b.strip()]
+
+
+def _merge_indexes(
+    indexes: list[dict[str, list["FileRef"]]]
+) -> dict[str, list["FileRef"]]:
+    """
+    Union {month: [files]} maps from SEVERAL buckets so each month is loaded
+    ONCE with every account's files combined. Loading bucket-by-bucket would
+    be a data-loss bug: the second bucket's WRITE_TRUNCATE of a month's
+    partition would wipe the first bucket's freshly loaded rows.
+    """
+    merged: dict[str, list[FileRef]] = {}
+    for idx in indexes:
+        for ym, refs in idx.items():
+            merged.setdefault(ym, []).extend(refs)
+    return merged
+
+
+def _read_month(refs: list["FileRef"]) -> list[dict]:
+    """Download + parse + annotate all files of ONE month (any bucket mix)."""
+    records: list[dict] = []
+    for ref in refs:
+        rows = _blob_to_records(ref.blob)
+        # Bucket-qualified source => full traceability across accounts.
+        # (Goes into BigQuery data, never into public logs.)
+        _annotate(rows, ref.pkg, ref.ym, f"{ref.blob.bucket.name}/{ref.blob.name}")
+        records.extend(rows)
+        log.debug("  + %s (%d rows)", ref.blob.name, len(rows))
+    return records
+
+
 class PlayReportsReader:
     """Two-phase, bounded-memory reader.
 
@@ -268,16 +304,6 @@ class PlayReportsReader:
                 continue
             index.setdefault(ym, []).append(FileRef(blob, "__account__", ym))
         return index
-
-    def read_month(self, refs: list[FileRef]) -> list[dict]:
-        """Download + parse + annotate all files of ONE month."""
-        records: list[dict] = []
-        for ref in refs:
-            rows = _blob_to_records(ref.blob)
-            _annotate(rows, ref.pkg, ref.ym, ref.blob.name)
-            records.extend(rows)
-            log.debug("  + %s (%d rows)", ref.blob.name, len(rows))
-        return records
 
 # =========================================================================== #
 # SECTION 2 — Writing to BigQuery (idempotent, per-month partitions)
@@ -420,7 +446,7 @@ def _allowlist_from_env() -> set[str] | None:
 
 
 def main() -> int:
-    bucket = _env("GCS_PLAY_BUCKET", required=True)
+    buckets = _parse_buckets(_env("GCS_PLAY_BUCKET", required=True))
     project = _env("GCP_PROJECT_ID", required=True)
     dataset = _env("BQ_DATASET", default="play_reports")
     location = _env("BQ_LOCATION", default="US")
@@ -433,14 +459,16 @@ def main() -> int:
     allowlist = _allowlist_from_env()
 
     # NOTE: deliberately NOT logging bucket / project / service identifiers —
-    # in a public repo these logs are world-readable.
-    log.info("Config: dataset=%s location=%s months=%d (%s..%s) apps=%s expiry=%s",
-             dataset, location, len(months), min(months), max(months),
+    # in a public repo these logs are world-readable. Counts only.
+    log.info("Config: dataset=%s location=%s buckets=%d months=%d (%s..%s) "
+             "apps=%s expiry=%s",
+             dataset, location, len(buckets), len(months), min(months),
+             max(months),
              f"{len(allowlist)} allowlisted" if allowlist else "ALL",
              f"{partition_expiration_days}d" if partition_expiration_days
              else "keep forever")
 
-    reader = PlayReportsReader(bucket, project)
+    readers = [PlayReportsReader(b, project) for b in buckets]
     writer = BigQueryWriter(project, dataset, location,
                             partition_expiration_days=partition_expiration_days)
 
@@ -453,13 +481,20 @@ def main() -> int:
                      if spec["scope"] == "per_app" else spec["report"])
             log.info("=== %s ===", table)
             try:
-                # Phase 1: ONE cheap metadata listing -> {month: [files]}
+                # Phase 1: ONE cheap metadata listing PER BUCKET, merged into
+                # a single {month: [files]} map — so every month is loaded
+                # ONCE with all accounts' files (never truncating each other).
                 if spec["scope"] == "per_app":
-                    index = reader.index_per_app(
-                        spec["prefix"], spec["report"], dim, months, allowlist
-                    )
+                    index = _merge_indexes([
+                        rd.index_per_app(spec["prefix"], spec["report"],
+                                         dim, months, allowlist)
+                        for rd in readers
+                    ])
                 else:
-                    index = reader.index_account(spec["prefix"], months)
+                    index = _merge_indexes([
+                        rd.index_account(spec["prefix"], months)
+                        for rd in readers
+                    ])
             except Exception as exc:
                 log.exception("FAILED listing: %s", table)
                 errors.append(f"{table} (listing): {exc}")
@@ -473,7 +508,7 @@ def main() -> int:
             # bad month can never take down the other months.
             for ym in sorted(index):
                 try:
-                    rows = reader.read_month(index[ym])
+                    rows = _read_month(index[ym])
                     loaded = writer.load_month(table, ym, rows)
                     total_rows += loaded
                     log.info("  %s: %d file(s) -> %d rows loaded",

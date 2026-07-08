@@ -28,8 +28,15 @@ Run in CI    : auth handled by Workload Identity Federation (see workflow YAML)
 
 Environment:
   GCS_PLAY_BUCKET            required  ONE bucket URI/id — or a COMMA-SEPARATED
-                                       list of them to sweep multiple Play
-                                       developer accounts in a single run
+                                       list. Prefix any entry with a friendly
+                                       console label to fill the source_console
+                                       column, e.g.
+                                         "TikTok=gs://pubsite_prod_1, ACME=gs://pubsite_prod_2"
+                                       (no prefix => label defaults to bucket id)
+  GCS_PLAY_BUCKET_2 (.._9)   optional  more bucket lists, each read by
+  GCP_SA_EMAIL_2    (.._9)             IMPERSONATING the paired service
+                                       account (Play caps one identity at 10
+                                       developer accounts; shard past it)
   GCP_PROJECT_ID             required  your GCP project id
   BQ_DATASET                 optional  default: play_reports
   BQ_LOCATION                optional  default: US (decide before first run)
@@ -52,6 +59,8 @@ from datetime import datetime, timezone
 
 from google.cloud import storage, bigquery
 from google.api_core.retry import Retry
+import google.auth
+from google.auth import impersonated_credentials
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -97,7 +106,8 @@ _RETRY = Retry(initial=1.0, maximum=30.0, multiplier=2.0, timeout=300.0)
 
 # Column names reserved for our own metadata. Any incoming CSV column that
 # cleans to one of these is dropped (our version is authoritative).
-RESERVED_COLUMNS = {"report_month_date", "package_name", "_loaded_at", "_source_file"}
+RESERVED_COLUMNS = {"report_month_date", "package_name", "source_console",
+                    "_loaded_at", "_source_file"}
 
 # Account-wide financial reports (sales/earnings) identify the app in Google's
 # own column. We promote it into `package_name` per row, so EVERY table shares
@@ -106,10 +116,11 @@ _APP_ID_COLUMNS = ("package_id", "product_id")
 
 
 class FileRef(NamedTuple):
-    """A matched report file: which blob, which app, which month."""
+    """A matched report file: which blob, which app, which month, which console."""
     blob: "storage.Blob"
     pkg: str
     ym: str
+    console: str = ""
 
 
 def clean_column(name: str) -> str:
@@ -188,7 +199,8 @@ def _blob_to_records(blob) -> list[dict]:
     return _csv_bytes_to_records(raw)
 
 
-def _annotate(rows: list[dict], pkg: str, ym: str, source: str) -> None:
+def _annotate(rows: list[dict], pkg: str, ym: str, source: str,
+              console: str) -> None:
     month_date = f"{ym[:4]}-{ym[4:6]}-01"
     now = datetime.now(timezone.utc).isoformat()
     for r in rows:
@@ -202,13 +214,43 @@ def _annotate(rows: list[dict], pkg: str, ym: str, source: str) -> None:
             )
         else:
             r["package_name"] = pkg
+        r["source_console"] = console      # friendly label for THIS console
         r["_loaded_at"] = now
         r["_source_file"] = source
 
 
-def _parse_buckets(raw: str) -> list[str]:
-    """'gs://a/x, gs://b' -> ['gs://a/x', 'gs://b']. One or many buckets."""
-    return [b.strip() for b in raw.split(",") if b.strip()]
+def _parse_buckets(raw: str) -> list[tuple[str, str]]:
+    """
+    Parse a comma-separated bucket list. Each entry may carry a friendly
+    console label, separated from the bucket by ':' OR '=' :
+
+        'apex: gs://pubsite_prod_1, app variety digital = gs://pubsite_prod_2'
+        -> [('apex', 'gs://pubsite_prod_1'),
+            ('app variety digital', 'gs://pubsite_prod_2')]
+
+    The bucket is anchored on 'gs://' (or a bare 'pubsite_prod_' id), so labels
+    may freely contain spaces, colons, equals, or alignment padding without any
+    ambiguity. An entry with no label gets '' — the reader then defaults it to
+    the bucket id, so the source_console column is never blank.
+    """
+    out: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        pos = entry.lower().find("gs://")
+        if pos > 0:                       # 'label<sep> gs://bucket'  (sep = : or =)
+            label = entry[:pos].strip().rstrip(":=").strip()
+            bucket = entry[pos:].strip()
+        elif pos == 0:                    # 'gs://bucket'  (no label)
+            label, bucket = "", entry
+        elif "=" in entry:                # 'label=pubsite_prod_id'  (bare id)
+            lab, buc = entry.split("=", 1)
+            label, bucket = lab.strip(), buc.strip()
+        else:                             # bare 'pubsite_prod_id'  (no label)
+            label, bucket = "", entry
+        out.append((label, bucket))
+    return out
 
 
 def _merge_indexes(
@@ -234,7 +276,8 @@ def _read_month(refs: list["FileRef"]) -> list[dict]:
         rows = _blob_to_records(ref.blob)
         # Bucket-qualified source => full traceability across accounts.
         # (Goes into BigQuery data, never into public logs.)
-        _annotate(rows, ref.pkg, ref.ym, f"{ref.blob.bucket.name}/{ref.blob.name}")
+        _annotate(rows, ref.pkg, ref.ym,
+                  f"{ref.blob.bucket.name}/{ref.blob.name}", ref.console)
         records.extend(rows)
         log.debug("  + %s (%d rows)", ref.blob.name, len(rows))
     return records
@@ -248,12 +291,19 @@ class PlayReportsReader:
     Phase 2 (read_month): download + parse ONLY one month's files at a time.
     """
 
-    def __init__(self, bucket_id: str, project: str):
+    def __init__(self, bucket_id: str, project: str, client=None,
+                 console: str = ""):
         # Accept 'pubsite_prod_rev_123' or 'gs://pubsite_prod_rev_123/stats/...'
         bucket_id = bucket_id.replace("gs://", "").split("/")[0].strip()
-        self._client = storage.Client(project=project)
+        # An injected client lets a bucket be read under a DIFFERENT identity
+        # (impersonated service account) while BigQuery writes stay on the
+        # workflow's primary identity.
+        self._client = client or storage.Client(project=project)
         self._bucket = self._client.bucket(bucket_id)
         self.bucket_id = bucket_id
+        # Friendly label for this console; falls back to the bucket id so the
+        # source_console column is never empty.
+        self.console = console.strip() or bucket_id
 
     def _list(self, prefix: str):
         return self._client.list_blobs(self._bucket, prefix=prefix, retry=_RETRY)
@@ -283,7 +333,7 @@ class PlayReportsReader:
             pkg = m.group("pkg")
             if allowlist and pkg not in allowlist:
                 continue
-            index.setdefault(ym, []).append(FileRef(blob, pkg, ym))
+            index.setdefault(ym, []).append(FileRef(blob, pkg, ym, self.console))
         return index
 
     def index_account(self, prefix: str,
@@ -302,7 +352,8 @@ class PlayReportsReader:
             ym = next((x for x in month_re.findall(base) if x in months), None)
             if ym is None:
                 continue
-            index.setdefault(ym, []).append(FileRef(blob, "__account__", ym))
+            index.setdefault(ym, []).append(
+                FileRef(blob, "__account__", ym, self.console))
         return index
 
 # =========================================================================== #
@@ -312,6 +363,7 @@ class PlayReportsReader:
 _META = [
     bigquery.SchemaField("report_month_date", "DATE"),
     bigquery.SchemaField("package_name", "STRING"),
+    bigquery.SchemaField("source_console", "STRING"),
     bigquery.SchemaField("_loaded_at", "TIMESTAMP"),
     bigquery.SchemaField("_source_file", "STRING"),
 ]
@@ -445,8 +497,54 @@ def _allowlist_from_env() -> set[str] | None:
     return {p.strip() for p in raw.split(",") if p.strip()} or None
 
 
+_CLOUD_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+
+
+def _bucket_groups() -> list[tuple[str | None, list[str]]]:
+    """
+    Returns [(impersonate_email_or_None, [buckets...]), ...].
+
+    Group 1: GCS_PLAY_BUCKET — read as the workflow's own identity.
+    Groups 2..9: GCS_PLAY_BUCKET_n paired with GCP_SA_EMAIL_n — read by
+    impersonating that service account. Play Console caps ONE identity at 10
+    developer accounts, so large empires shard their consoles across several
+    service accounts; this makes one run sweep all shards together (a
+    run-per-shard would let WRITE_TRUNCATE wipe the other shards' rows).
+    """
+    groups: list[tuple[str | None, list[str]]] = [
+        (None, _parse_buckets(_env("GCS_PLAY_BUCKET", required=True)))
+    ]
+    for n in range(2, 10):
+        raw = os.environ.get(f"GCS_PLAY_BUCKET_{n}", "").strip()
+        if not raw:
+            continue
+        email = os.environ.get(f"GCP_SA_EMAIL_{n}", "").strip()
+        if not email:
+            log.error("GCS_PLAY_BUCKET_%d is set but GCP_SA_EMAIL_%d is "
+                      "missing — pair every extra bucket list with the "
+                      "service account that can read it.", n, n)
+            sys.exit(2)
+        groups.append((email, _parse_buckets(raw)))
+    return groups
+
+
+def _storage_client(project: str, impersonate: str | None):
+    """Primary identity when impersonate is None; otherwise a client whose
+    every call runs as the target service account (keyless, via the IAM
+    Credentials API — free)."""
+    if not impersonate:
+        return storage.Client(project=project)
+    source, _ = google.auth.default()
+    creds = impersonated_credentials.Credentials(
+        source_credentials=source,
+        target_principal=impersonate,
+        target_scopes=_CLOUD_SCOPES,
+    )
+    return storage.Client(project=project, credentials=creds)
+
+
 def main() -> int:
-    buckets = _parse_buckets(_env("GCS_PLAY_BUCKET", required=True))
+    groups = _bucket_groups()
     project = _env("GCP_PROJECT_ID", required=True)
     dataset = _env("BQ_DATASET", default="play_reports")
     location = _env("BQ_LOCATION", default="US")
@@ -457,18 +555,25 @@ def main() -> int:
 
     months = set(_recent_months(months_to_load))
     allowlist = _allowlist_from_env()
+    total_buckets = sum(len(b) for _, b in groups)
 
     # NOTE: deliberately NOT logging bucket / project / service identifiers —
     # in a public repo these logs are world-readable. Counts only.
-    log.info("Config: dataset=%s location=%s buckets=%d months=%d (%s..%s) "
-             "apps=%s expiry=%s",
-             dataset, location, len(buckets), len(months), min(months),
-             max(months),
+    log.info("Config: dataset=%s location=%s buckets=%d identities=%d "
+             "months=%d (%s..%s) apps=%s expiry=%s",
+             dataset, location, total_buckets, len(groups), len(months),
+             min(months), max(months),
              f"{len(allowlist)} allowlisted" if allowlist else "ALL",
              f"{partition_expiration_days}d" if partition_expiration_days
              else "keep forever")
 
-    readers = [PlayReportsReader(b, project) for b in buckets]
+    readers = []
+    for impersonate, bkts in groups:
+        client = _storage_client(project, impersonate)   # one client per identity
+        readers.extend(
+            PlayReportsReader(bucket, project, client=client, console=label)
+            for label, bucket in bkts
+        )
     writer = BigQueryWriter(project, dataset, location,
                             partition_expiration_days=partition_expiration_days)
 

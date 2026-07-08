@@ -27,16 +27,17 @@ Run locally  : `gcloud auth application-default login` then `python main.py`
 Run in CI    : auth handled by Workload Identity Federation (see workflow YAML)
 
 Environment:
-  GCS_PLAY_BUCKET            required  ONE bucket URI/id — or a COMMA-SEPARATED
-                                       list. Prefix any entry with a friendly
-                                       console label to fill the source_console
-                                       column, e.g.
-                                         "TikTok=gs://pubsite_prod_1, ACME=gs://pubsite_prod_2"
-                                       (no prefix => label defaults to bucket id)
-  GCS_PLAY_BUCKET_2 (.._9)   optional  more bucket lists, each read by
-  GCP_SA_EMAIL_2    (.._9)             IMPERSONATING the paired service
-                                       account (Play caps one identity at 10
-                                       developer accounts; shard past it)
+  GCS_PLAY_BUCKET            required  ALL bucket URIs/ids, comma-separated.
+                                       Prefix any entry with a friendly console
+                                       label (':' or '=') to fill source_console:
+                                         "apex: gs://pubsite_prod_1, acme = gs://pubsite_prod_2"
+                                       (no label => defaults to the bucket id)
+  GCP_SA_EMAIL_2 (.._9)      optional  extra service-account emails. Play caps
+                                       ONE identity at 10 developer accounts, so
+                                       consoles past 10 live on more SAs. You do
+                                       NOT sort buckets by SA — the pipeline
+                                       probes each bucket and reads it with
+                                       whichever identity has access.
   GCP_PROJECT_ID             required  your GCP project id
   BQ_DATASET                 optional  default: play_reports
   BQ_LOCATION                optional  default: US (decide before first run)
@@ -500,32 +501,23 @@ def _allowlist_from_env() -> set[str] | None:
 _CLOUD_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
 
-def _bucket_groups() -> list[tuple[str | None, list[str]]]:
+def _impersonation_emails() -> list[str]:
     """
-    Returns [(impersonate_email_or_None, [buckets...]), ...].
+    Extra service-account identities to try, from GCP_SA_EMAIL_2..9.
 
-    Group 1: GCS_PLAY_BUCKET — read as the workflow's own identity.
-    Groups 2..9: GCS_PLAY_BUCKET_n paired with GCP_SA_EMAIL_n — read by
-    impersonating that service account. Play Console caps ONE identity at 10
-    developer accounts, so large empires shard their consoles across several
-    service accounts; this makes one run sweep all shards together (a
-    run-per-shard would let WRITE_TRUNCATE wipe the other shards' rows).
+    Play Console caps ONE identity at 10 developer accounts, so a big empire
+    spreads its consoles across several service accounts. You do NOT tell the
+    pipeline which bucket belongs to which SA — it probes each bucket against
+    the primary identity first, then each of these, and reads it with whichever
+    one actually has access. Add a console on a new SA later? Just append its
+    email here; routing keeps working with zero re-shuffling.
     """
-    groups: list[tuple[str | None, list[str]]] = [
-        (None, _parse_buckets(_env("GCS_PLAY_BUCKET", required=True)))
-    ]
+    out: list[str] = []
     for n in range(2, 10):
-        raw = os.environ.get(f"GCS_PLAY_BUCKET_{n}", "").strip()
-        if not raw:
-            continue
-        email = os.environ.get(f"GCP_SA_EMAIL_{n}", "").strip()
-        if not email:
-            log.error("GCS_PLAY_BUCKET_%d is set but GCP_SA_EMAIL_%d is "
-                      "missing — pair every extra bucket list with the "
-                      "service account that can read it.", n, n)
-            sys.exit(2)
-        groups.append((email, _parse_buckets(raw)))
-    return groups
+        e = os.environ.get(f"GCP_SA_EMAIL_{n}", "").strip()
+        if e:
+            out.append(e)
+    return out
 
 
 def _storage_client(project: str, impersonate: str | None):
@@ -543,8 +535,27 @@ def _storage_client(project: str, impersonate: str | None):
     return storage.Client(project=project, credentials=creds)
 
 
+def _can_read(client, bucket_id: str) -> bool:
+    """True if this identity can list the bucket (cheap 1-object probe)."""
+    try:
+        next(iter(client.list_blobs(bucket_id, max_results=1, retry=_RETRY)), None)
+        return True
+    except Exception:
+        return False
+
+
+def _route_bucket(bucket_id: str, clients: list[tuple[str, object]]):
+    """Return (client, identity_tag) for the first identity that can read the
+    bucket, or (None, None). identity_tag is 'primary'/'sa#2'/... — never an
+    email or bucket id, so it's safe to log in a public repo."""
+    for tag, client in clients:
+        if _can_read(client, bucket_id):
+            return client, tag
+    return None, None
+
+
 def main() -> int:
-    groups = _bucket_groups()
+    buckets = _parse_buckets(_env("GCS_PLAY_BUCKET", required=True))
     project = _env("GCP_PROJECT_ID", required=True)
     dataset = _env("BQ_DATASET", default="play_reports")
     location = _env("BQ_LOCATION", default="US")
@@ -555,25 +566,49 @@ def main() -> int:
 
     months = set(_recent_months(months_to_load))
     allowlist = _allowlist_from_env()
-    total_buckets = sum(len(b) for _, b in groups)
+
+    # Build one client per identity: primary (the workflow's own SA via WIF)
+    # plus one impersonated client for each GCP_SA_EMAIL_2..9.
+    clients: list[tuple[str, object]] = [("primary", _storage_client(project, None))]
+    for i, email in enumerate(_impersonation_emails(), start=2):
+        clients.append((f"sa#{i}", _storage_client(project, email)))
 
     # NOTE: deliberately NOT logging bucket / project / service identifiers —
-    # in a public repo these logs are world-readable. Counts only.
+    # in a public repo these logs are world-readable. Counts + tags only.
     log.info("Config: dataset=%s location=%s buckets=%d identities=%d "
              "months=%d (%s..%s) apps=%s expiry=%s",
-             dataset, location, total_buckets, len(groups), len(months),
+             dataset, location, len(buckets), len(clients), len(months),
              min(months), max(months),
              f"{len(allowlist)} allowlisted" if allowlist else "ALL",
              f"{partition_expiration_days}d" if partition_expiration_days
              else "keep forever")
 
+    # Auto-route every bucket to the identity that can actually read it.
     readers = []
-    for impersonate, bkts in groups:
-        client = _storage_client(project, impersonate)   # one client per identity
-        readers.extend(
-            PlayReportsReader(bucket, project, client=client, console=label)
-            for label, bucket in bkts
-        )
+    routing: dict[str, int] = {}
+    unreadable: list[str] = []
+    for label, bucket in buckets:
+        bid = bucket.replace("gs://", "").split("/")[0].strip()
+        client, tag = _route_bucket(bid, clients)
+        if client is None:
+            unreadable.append(label or "(unlabeled)")
+            continue
+        readers.append(
+            PlayReportsReader(bucket, project, client=client, console=label))
+        routing[tag] = routing.get(tag, 0) + 1
+
+    log.info("Routing: %s%s",
+             ", ".join(f"{k}={v}" for k, v in sorted(routing.items())) or "none",
+             f" | UNREADABLE={len(unreadable)}" if unreadable else "")
+    for u in unreadable:
+        # label only (user-chosen) — never the bucket id — to stay log-safe.
+        log.error("Unreadable bucket (label=%s): still propagating, or its "
+                  "console was invited to a service account not listed in "
+                  "GCP_SA_EMAIL_2..9.", u)
+    if not readers:
+        log.error("No readable buckets — nothing to do. Aborting.")
+        return 2
+
     writer = BigQueryWriter(project, dataset, location,
                             partition_expiration_days=partition_expiration_days)
 

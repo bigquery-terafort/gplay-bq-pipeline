@@ -60,6 +60,7 @@ from datetime import datetime, timezone
 
 from google.cloud import storage, bigquery
 from google.api_core.retry import Retry
+from google.api_core.exceptions import NotFound
 import google.auth
 from google.auth import impersonated_credentials
 
@@ -189,7 +190,18 @@ def _csv_bytes_to_records(raw: bytes) -> list[dict]:
 
 
 def _blob_to_records(blob) -> list[dict]:
-    raw = blob.download_as_bytes(retry=_RETRY)
+    try:
+        raw = blob.download_as_bytes(retry=_RETRY)
+    except NotFound:
+        # The file was present when we LISTED the bucket but gone by the time we
+        # DOWNLOAD it. Google continuously regenerates current-month reports, so
+        # a long backfill can race with that rewrite. This is benign: skip the
+        # vanished file (the next run loads the fresh version). Do NOT fail the
+        # run over it. (No filename logged -> public-repo-log safe.)
+        log.warning("A report file vanished between listing and download "
+                    "(Google was regenerating it) — skipped; the next run "
+                    "will pick up the new version.")
+        return []
     if blob.name.lower().endswith(".zip"):
         out: list[dict] = []
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:

@@ -71,6 +71,14 @@ jobs:
           # Optional (add as Secrets only if you want them):
           APPS_ALLOWLIST:            ${{ secrets.APPS_ALLOWLIST }}
           PARTITION_EXPIRATION_DAYS: ${{ secrets.PARTITION_EXPIRATION_DAYS }}
+          # Optional identity shards: Play Console caps ONE identity at 10
+          # developer accounts. Extra consoles go on extra service accounts;
+          # pair each bucket list with the SA that was invited to them. The
+          # primary SA must hold roles/iam.serviceAccountTokenCreator on each.
+          GCS_PLAY_BUCKET_2: ${{ secrets.GCS_PLAY_BUCKET_2 }}
+          GCP_SA_EMAIL_2:    ${{ secrets.GCP_SA_EMAIL_2 }}
+          GCS_PLAY_BUCKET_3: ${{ secrets.GCS_PLAY_BUCKET_3 }}
+          GCP_SA_EMAIL_3:    ${{ secrets.GCP_SA_EMAIL_3 }}
         run: python main.py
 
       - name: Keepalive (defeat GitHub's 60-day scheduled-workflow auto-disable)

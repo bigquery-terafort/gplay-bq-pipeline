@@ -22,7 +22,7 @@ on:
       months:
         description: "How many recent months to (re)load. Use a big number (e.g. 120) once to backfill history."
         required: false
-        default: "2"
+        default: "3"
 
 permissions:
   id-token: write      # REQUIRED: lets the job mint a GitHub OIDC token for WIF

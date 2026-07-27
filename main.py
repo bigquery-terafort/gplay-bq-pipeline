@@ -13,6 +13,11 @@ Design (bleed-proof by construction):
   * Idempotent: each month's BigQuery partition is atomically replaced via
     WRITE_TRUNCATE on table$YYYYMM. Re-runs never duplicate; skipped runs
     self-heal on the next run.
+  * FAILS CLOSED on partial bucket access. Because each month is REPLACED,
+    a run that reached only some consoles would silently DELETE the others
+    from every month in the window. If any configured bucket is unreadable,
+    the run aborts BEFORE writing anything and exits non-zero. Stale data is
+    recoverable; deleted data that downstream has already consumed is not.
   * Schema-drift proof: every report column loads as STRING with
     ALLOW_FIELD_ADDITION, so Google adding/renaming columns (fee columns
     change in July 2026) can never break ingestion. Cast in SQL views.
@@ -22,6 +27,11 @@ Design (bleed-proof by construction):
   * PUBLIC-REPO SAFE: never logs the bucket name, project id, service
     account, or package names at INFO level — public Actions logs stay clean.
     (Config also lives in GitHub Secrets, which GitHub auto-masks.)
+
+TIMING NOTE (do not schedule this late): downstream gp_staging reads the
+output at ~07:24 UTC and unified builds at ~07:26 UTC. This run takes roughly
+2-3.5 hours, so the workflow cron is 02:00 UTC. Starting later means every
+downstream table consumes day-old raw.
 
 Run locally  : `gcloud auth application-default login` then `python main.py`
 Run in CI    : auth handled by Workload Identity Federation (see workflow YAML)
@@ -41,7 +51,11 @@ Environment:
   GCP_PROJECT_ID             required  your GCP project id
   BQ_DATASET                 optional  default: play_reports
   BQ_LOCATION                optional  default: US (decide before first run)
-  MONTHS_TO_LOAD             optional  default: 2 (set 120 once to backfill)
+  MONTHS_TO_LOAD             optional  default: 2 (workflow sends 3; set 120
+                                       once to backfill). Google restates recent
+                                       days, so the window must comfortably
+                                       exceed the restatement lag — once a month
+                                       leaves the window its values freeze.
   APPS_ALLOWLIST             optional  comma-separated packages; empty = ALL apps
   PARTITION_EXPIRATION_DAYS  optional  e.g. 730 to auto-drop old months
   LOG_LEVEL                  optional  default: INFO
@@ -548,11 +562,22 @@ def _storage_client(project: str, impersonate: str | None):
 
 
 def _can_read(client, bucket_id: str) -> bool:
-    """True if this identity can list the bucket (cheap 1-object probe)."""
+    """True if this identity can list the bucket (cheap 1-object probe).
+
+    A False here is NORMAL and expected: with several service accounts every
+    bucket is probed against each identity, and only one of them has access —
+    the others legitimately raise Forbidden. We therefore cannot cleanly tell
+    "wrong identity" from "GCS hiccup" at this level, and we don't need to:
+    main() now FAILS CLOSED when a bucket ends up unreadable by ALL identities,
+    so a transient error can only ever cost a red build and a retry — never a
+    silent partial load. The exception TYPE is logged at debug level (never the
+    bucket id, so public Actions logs stay clean) to keep it diagnosable.
+    """
     try:
         next(iter(client.list_blobs(bucket_id, max_results=1, retry=_RETRY)), None)
         return True
-    except Exception:
+    except Exception as exc:
+        log.debug("bucket probe failed: %s", type(exc).__name__)
         return False
 
 
@@ -617,6 +642,34 @@ def main() -> int:
         log.error("Unreadable bucket (label=%s): still propagating, or its "
                   "console was invited to a service account not listed in "
                   "GCP_SA_EMAIL_2..9.", u)
+
+    # ---------------------------------------------------------------------- #
+    # FAIL CLOSED — do not load a partial estate.
+    #
+    # Every month is written with WRITE_TRUNCATE, which REPLACES the whole
+    # partition. A run that reached only SOME buckets would therefore DELETE
+    # the missing consoles from every month in the window — silently, and
+    # (before this guard) with a green exit code, because an unreadable bucket
+    # was only logged and never counted as an error.
+    #
+    # The probe in _can_read() catches ANY exception, so a single transient
+    # 5xx / timeout / token-refresh blip is enough to mark a console
+    # unreadable. One hiccup must never cost a console its history.
+    #
+    # Stale data is recoverable — the next run reloads the entire window from
+    # scratch. Deleted data that downstream staging/Looker has already
+    # consumed is not. So: abort BEFORE writing anything, and exit non-zero
+    # so GitHub turns the run red and emails.
+    # ---------------------------------------------------------------------- #
+    if unreadable:
+        log.error("ABORTING BEFORE ANY LOAD: %d of %d configured bucket(s) are "
+                  "unreadable. Continuing would replace %d month partition(s) "
+                  "WITHOUT those consoles, deleting their rows. Nothing has "
+                  "been written. Fix access (or let the transient error clear) "
+                  "and re-run — the next run reloads the full window.",
+                  len(unreadable), len(buckets), len(months))
+        return 2
+
     if not readers:
         log.error("No readable buckets — nothing to do. Aborting.")
         return 2

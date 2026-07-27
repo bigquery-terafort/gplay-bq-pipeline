@@ -14,7 +14,6 @@ name: Play Console -> BigQuery (daily)
 
 on:
   schedule:
-    # 06:30 UTC daily. Play data lags 3-7 days, so timing doesn't matter; a late
     # or skipped run is harmless because the per-month reload self-heals.
     - cron: "0 2 * * *"
   workflow_dispatch:

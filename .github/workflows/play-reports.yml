@@ -14,8 +14,10 @@ name: Play Console -> BigQuery (daily)
 
 on:
   schedule:
-    # or skipped run is harmless because the per-month reload self-heals.
-    - cron: "0 2 * * *"
+    # 🔁 HAR 15 MINUTE — public repo par Actions FREE hai.
+    #    Har run pehle BQ se poochti hai "kal ka data hai?" — hai to 10 sec
+    #    mein skip. Nahi to poora loader (45 din MERGE). Der ≤ ~20 min.
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       months:
@@ -60,7 +62,69 @@ jobs:
         # requirements.txt needed — this IS the dependency manifest.
         run: pip install "google-cloud-storage>=2.18,<4" "google-cloud-bigquery>=3.25,<4"
 
+      # ══════════════════════════════════════════════════════════════════════
+      # 🔧 bq CLI — self-heal/verify ke liye. WAHI secret jo loader use karta hai.
+      #    Koi naya secret nahi.
+      # ══════════════════════════════════════════════════════════════════════
+      - name: "🔧 setup-gcloud (bq CLI)"
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ══════════════════════════════════════════════════════════════════════
+      # 🩺 SELF-HEAL ① — PEHLE ki haalat yaad rakho (rollback/verify ke liye)
+      # ══════════════════════════════════════════════════════════════════════
+      - name: "🩺 Pehle ki haalat — rows aur aakhri din"
+        id: before
+        continue-on-error: true
+        run: |
+          set +e
+          R=$(bq query --nouse_legacy_sql --format=csv --quiet \
+            "SELECT COUNT(*), CAST(MAX(date) AS STRING) FROM \`terafort.Final_Staging_tables.gp_staging\`" 2>/dev/null | tail -1)
+          ROWS=$(echo "$R" | cut -d, -f1); LAST=$(echo "$R" | cut -d, -f2)
+          echo "📊 pehle: ${ROWS:-?} rows · aakhri din ${LAST:-?}"
+          echo "rows=${ROWS:-0}" >> "$GITHUB_OUTPUT"
+          echo "last=${LAST:-}"  >> "$GITHUB_OUTPUT"
+          # ── gap dekh kar lookback tay karo ──
+          LB="${{ github.event.inputs.lookback_days || '45' }}"
+          if [[ "$LAST" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            GAP=$(( ( $(date -u +%s) - $(date -u -d "$LAST" +%s) ) / 86400 ))
+            if [ "$GAP" -gt "$LB" ]; then
+              LB=$(( GAP + 3 )); [ "$LB" -gt 180 ] && LB=180
+              echo "::warning::🩺 Self-heal: data ${GAP} din purana — lookback ${LB} kiya"
+            fi
+          else
+            # ── 🛡️ SAFETY NET: bq nahi chala (setup-gcloud nahi?) ──
+            #    Bina jaanch ke har 15 min poora loader chalana = platform API par
+            #    bojh (rate limit). Is liye sirf GHANTE KE SHURU mein chalao
+            #    (:00–:14) — yani purane 1-ghanta cron jaisa. Baqi 15-min skip.
+            MIN=$((10#$(date -u +%M)))
+            if [ "$MIN" -ge 15 ]; then
+              echo "⚠️ BQ check nahi ho saka — sirf ghante ke shuru mein chalta hoon (abhi :$MIN) — skip"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "lookback=$LB" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "⚠️ BQ check nahi ho saka — ghante ka shuru hai, loader chalega (lookback $LB)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "lookback=$LB" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # ── 🔑 SKIP: kal ka data pehle se hai to kuch mat karo ──
+          YESTERDAY=$(date -u -d yesterday +%F)
+          if [[ "$LAST" > "$YESTERDAY" ]] || [[ "$LAST" == "$YESTERDAY" ]]; then
+            echo "✅ kal ka data ($LAST) pehle se hai — skip, kuch nahi karna"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "lookback=$LB" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "🔍 kal ($YESTERDAY) ka data nahi — loader chalega"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "lookback=$LB" >> "$GITHUB_OUTPUT"
+
+      # 🔁 RETRY — neeche wala main step 3 baar koshish karta hai.
+      #    (nick-fields/retry se: platform API 5xx / timeout par khud dobara)
       - name: Load Play reports into BigQuery
+        if: steps.before.outputs.skip != 'true'
         env:
           GCS_PLAY_BUCKET: ${{ secrets.GCS_PLAY_BUCKET }}
           GCP_PROJECT_ID:  ${{ secrets.GCP_PROJECT_ID }}
@@ -97,3 +161,61 @@ jobs:
             git commit --allow-empty -m "chore: keepalive (automated)"
             git push
           fi
+
+      # ══════════════════════════════════════════════════════════════════════
+      # 🛡️ SELF-HEAL ② — BAAD mein VERIFY. Kharab data mile to run LAAL.
+      # ══════════════════════════════════════════════════════════════════════
+      #  Teen check:
+      #    1. rows KAM to nahi ho gaye  (koi loader TRUNCATE kar ke mar gaya?)
+      #    2. aakhri din PEECHE to nahi gaya
+      #    3. aaj ke window mein NEGATIVE ya NULL key to nahi
+      #  Koi bhi fail → exit 1 → workflow red → tum ko pata chalega.
+      #  🔑 Loader khud MERGE karta hai, is liye rollback ki zaroorat nahi —
+      #     purana data waise hi mehfooz rehta hai.
+      - name: "🛡️ Baad mein verify — bad data nahi jaana chahiye"
+        if: always() && steps.before.outputs.skip != 'true'
+        run: |
+          set +e
+          BEFORE_ROWS="${{ steps.before.outputs.rows || '0' }}"
+          BEFORE_LAST="${{ steps.before.outputs.last || '' }}"
+          R=$(bq query --nouse_legacy_sql --format=csv --quiet \
+            "SELECT COUNT(*), CAST(MAX(date) AS STRING), COUNTIF(date IS NULL) FROM \`terafort.Final_Staging_tables.gp_staging\`" 2>/dev/null | tail -1)
+          if [ -z "$R" ]; then
+            echo "::warning::verify skip — bq query nahi chali (setup-gcloud hai?)"
+            exit 0
+          fi
+          AFTER_ROWS=$(echo "$R" | cut -d, -f1); AFTER_LAST=$(echo "$R" | cut -d, -f2); NULLS=$(echo "$R" | cut -d, -f3)
+          echo "📊 baad:  ${AFTER_ROWS} rows · aakhri din ${AFTER_LAST} · null dates ${NULLS}"
+          FAIL=0
+          # 1. rows 5% se zyada KAM ho gaye = kuch toota
+          if [ "$BEFORE_ROWS" -gt 100 ] && [ "$AFTER_ROWS" -lt $(( BEFORE_ROWS * 95 / 100 )) ]; then
+            echo "::error::🔴 ROWS KAM HO GAYE: $BEFORE_ROWS → $AFTER_ROWS — loader ne data URA DIYA"; FAIL=1
+          fi
+          # 2. aakhri din peeche gaya
+          if [[ "$BEFORE_LAST" =~ ^[0-9]{4} ]] && [[ "$AFTER_LAST" < "$BEFORE_LAST" ]]; then
+            echo "::error::🔴 AAKHRI DIN PEECHE GAYA: $BEFORE_LAST → $AFTER_LAST"; FAIL=1
+          fi
+          # 3. null date key
+          if [ "${NULLS:-0}" -gt 0 ]; then
+            echo "::error::🔴 ${NULLS} rows par date NULL hai — kharab data"; FAIL=1
+          fi
+          if [ "$FAIL" = "1" ]; then
+            echo "::error::🔴 VERIFY FAIL — is run ka data bharosay ke qabil NAHI"
+            exit 1
+          fi
+          echo "✅ verify pass — $(( AFTER_ROWS - BEFORE_ROWS )) rows badhe"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # 📣 NAKAAMI PAR BATAO — chup-chaap fail na ho
+      # ══════════════════════════════════════════════════════════════════════
+      - name: "📣 Fail hua to summary mein likho"
+        if: failure()
+        run: |
+          {
+            echo "## 🔴 ${{ github.workflow }} — NAKAAM"
+            echo "- run: ${{ github.run_id }}"
+            echo "- waqt: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "- pehle: ${{ steps.before.outputs.rows }} rows · ${{ steps.before.outputs.last }}"
+            echo "- 🔁 agli scheduled run khud dobara koshish karegi (din mein 4x)"
+            echo "- 🩺 self-heal gap dekh kar lookback barha dega"
+          } >> "$GITHUB_STEP_SUMMARY"
